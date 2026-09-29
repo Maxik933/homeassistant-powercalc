@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+## 0.10.0 - 2026-09-27
+
+- #4881 Centralize vacuum entity rules and expand integration mappings @bramstroker
+
+### 🚀 Features
+
+- #4880 Automatically select vacuum recording entities @bramstroker
+- #4882 Support portable Valetudo dock entity references @bramstroker
+
+## 0.9.0 - 2026-09-26
+
+- #4875 Improve analyser validation and simplify domain models @bramstroker
+
+### 🚀 Features
+
+- #4867 Add developer setting to accept 0 W readings @bramstroker
+- #4874 Analyse vacuum dock activities in the measure recorder @bramstroker
+
+### 🐛 Bug Fixes
+
+- #4860 Call media_player.volume_mute for the muted speaker baseline @LaurensBot
+
+## 0.8.0 - 2026-09-26
+
+### 🚀 Features
+
+- #4826 Autofill device connectivity in PowerCalc Measure @bramstroker
+- #4827 Allow changing the setup when remeasuring standby @bramstroker
+- #4839 Exclude transient effect commands from Measure recordings @bramstroker
+- #4858 Store profile LUTs as plain CSV and compress on installation @bramstroker
+
+### 🐛 Bug Fixes
+
+- #4818 Clarify measurement description and setup guidance @bramstroker
+- #4824 Warn when standby estimate metadata changes @bramstroker
+- #4828 Make standby calibration recoverable and tighten setup validation @bramstroker
+- #4850 Clarify vacuum measurement results and profile preparation @bramstroker
+
 ## 0.7.1 - 2026-09-20
 
 - #4751 Tapo smart support @TheLexus

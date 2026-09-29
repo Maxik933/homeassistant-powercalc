@@ -3,7 +3,12 @@ from unittest.mock import MagicMock
 
 from measure.controller.light.const import LutMode
 from measure.home_assistant.client import HomeAssistantEntityData, HomeAssistantManager
-from measure.home_assistant.entities import DeviceClass, EntityDomain, HomeAssistantEntityCatalog
+from measure.home_assistant.device_relations import map_profile_related_devices
+from measure.home_assistant.entities import (
+    DeviceClass,
+    EntityDomain,
+    HomeAssistantEntityCatalog,
+)
 import pytest
 
 
@@ -139,13 +144,16 @@ def _entity_data(*, power_state: str = "4.2") -> HomeAssistantEntityData:
 
 def test_catalog_applies_one_selection_policy_and_enriches_entities() -> None:
     home_assistant = MagicMock(spec=HomeAssistantManager)
-    home_assistant.get_entity_data.return_value = _entity_data()
+    data = _entity_data()
+    data.device_registry[0].update(name="Original device", name_by_user="Desk lamp device")
+    home_assistant.get_entity_data.return_value = data
 
     snapshot = HomeAssistantEntityCatalog(home_assistant).load_snapshot()
 
     lights = snapshot.select(domain=EntityDomain.LIGHT)
     assert [entity.entity_id for entity in lights] == ["light.desk"]
     assert lights[0].model_id == "LWA017"
+    assert lights[0].device_name == "Desk lamp device"
     assert lights[0].product_name == "Hue White Ambiance"
     assert lights[0].manufacturer == "Signify"
     assert lights[0].integration == "hue"
@@ -289,6 +297,30 @@ def test_catalog_handles_light_with_null_effect_list() -> None:
     assert lights[0].effect_list is None
 
 
+def test_catalog_filters_unrecordable_zigbee2mqtt_effects() -> None:
+    data = _entity_data()
+    data.entity_registry[0].platform = "mqtt"
+    data.device_registry[0]["identifiers"] = [["mqtt", "zigbee2mqtt_0x0017880102030405"]]
+    data.entities["light"].entities["desk"].state.attributes["effect_list"] = [
+        "blink",
+        "breathe",
+        "okay",
+        "channel_change",
+        "finish_effect",
+        "stop_effect",
+        "stop_colorloop",
+        "colorloop",
+    ]
+    home_assistant = MagicMock(spec=HomeAssistantManager)
+    home_assistant.get_entity_data.return_value = data
+
+    light = HomeAssistantEntityCatalog(home_assistant).load_snapshot().get("light.desk")
+
+    assert light is not None
+    assert light.effect_list == ["colorloop"]
+    assert LutMode.EFFECT in (light.supported_modes or [])
+
+
 def test_catalog_exposes_group_members_and_infers_their_shared_model() -> None:
     data = _entity_data()
     data.entities["light"].entities["second"] = _entity(
@@ -406,3 +438,72 @@ def test_snapshot_requires_exactly_one_entity_filter() -> None:
 
     with pytest.raises(ValueError, match="Specify exactly one entity filter"):
         snapshot.select(domain=EntityDomain.LIGHT, device_class=DeviceClass.POWER)
+
+
+def test_related_devices_follow_powercalc_child_and_roborock_dock_rules() -> None:
+    registry: list[dict[str, object]] = [
+        {"identifiers": [["roborock", "missing_id"]]},
+        {"id": "robot", "identifiers": [["roborock", "duid"]], "config_entry_id": "entry"},
+        {
+            "id": "dock",
+            "identifiers": [["roborock", "duid_dock"]],
+            "config_entry_id": "entry",
+            "parent_device_id": "robot",
+        },
+        # Same identifier convention, but another config entry: not this vacuum's dock.
+        {"id": "foreign_dock", "identifiers": [["roborock", "duid_dock"]], "config_entry_id": "other"},
+        {"id": "legacy", "identifiers": [["roborock", "old"]], "config_entries": ["legacy_entry"]},
+        {"id": "legacy_dock", "identifiers": [["roborock", "old_dock"]], "config_entries": ["legacy_entry"]},
+        # Only Roborock uses the _dock identifier convention.
+        {"id": "dreame", "identifiers": [["dreame_vacuum", "x"]], "config_entry_id": "dreame_entry"},
+        {"id": "dreame_dock", "identifiers": [["dreame_vacuum", "x_dock"]], "config_entry_id": "dreame_entry"},
+        {"id": "ups", "identifiers": "malformed", "config_entries": "malformed"},
+        {"id": "battery", "identifiers": [["nut", "b"], ["bad"]], "parent_device_id": "ups"},
+        {"id": "self", "parent_device_id": "self"},
+        # A bridge linked through via_device_id is not a related device.
+        {"id": "bulb", "via_device_id": "ups"},
+    ]
+
+    assert map_profile_related_devices(registry) == {
+        "robot": ["dock"],
+        "dock": ["robot"],
+        "legacy": ["legacy_dock"],
+        "ups": ["battery"],
+        "battery": ["ups"],
+    }
+
+
+def test_catalog_snapshot_exposes_related_devices() -> None:
+    data = _entity_data()
+    data.device_registry.append({"id": "child", "parent_device_id": "meter-device"})
+    home_assistant = MagicMock(spec=HomeAssistantManager)
+    home_assistant.get_entity_data.return_value = data
+
+    snapshot = HomeAssistantEntityCatalog(home_assistant).load_snapshot()
+
+    assert snapshot.related_device_ids == {"meter-device": ["child"], "child": ["meter-device"]}
+    assert snapshot.get("sensor.desk_power").related_device_ids == ["child"]
+
+
+@pytest.mark.parametrize("live", [True, False])
+def test_catalog_preserves_valetudo_identity(live: bool) -> None:
+    data = _entity_data()
+    data.device_registry.append({"id": "robot-device", "manufacturer": "Valetudo"})
+    data.entity_registry.append(
+        SimpleNamespace(
+            entity_id="sensor.renamed_dock",
+            device_id="robot-device",
+            platform="mqtt",
+            unique_id="RobotA_sensor_dock_status",
+            disabled_by=None if live else "user",
+        )
+    )
+    if live:
+        data.entities["sensor"].entities["renamed_dock"] = _entity("sensor.renamed_dock", "drying")
+    home_assistant = MagicMock(spec=HomeAssistantManager)
+    home_assistant.get_entity_data.return_value = data
+    descriptor = HomeAssistantEntityCatalog(home_assistant).load_snapshot().get("sensor.renamed_dock")
+    assert descriptor.unique_id == "RobotA_sensor_dock_status"
+    assert descriptor.manufacturer == "Valetudo"
+    assert descriptor.integration == "mqtt"
+    assert descriptor.has_live_state is live

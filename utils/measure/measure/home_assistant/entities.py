@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from enum import StrEnum
 import math
 from typing import TYPE_CHECKING, Any
@@ -6,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from measure.controller.light.capabilities import light_info_from_attributes, supported_light_modes
 from measure.controller.light.const import LutMode
+from measure.controller.light.effects import filter_recordable_effects
 from measure.home_assistant.client import HomeAssistantManager
 from measure.home_assistant.connectivity import Connectivity, detect_connectivity
 from measure.home_assistant.const import (
@@ -17,12 +19,14 @@ from measure.home_assistant.const import (
     HASS_ENTITY_GROUP_MEMBERS,
     HASS_ENTITY_UNIT_OF_MEASUREMENT,
 )
+from measure.home_assistant.device_relations import map_profile_related_devices
 
 if TYPE_CHECKING:
     from homeassistant_api import EntityRegistryEntry
 
 
 class EntityDomain(StrEnum):
+    SWITCH = "switch"
     LIGHT = "light"
     MEDIA_PLAYER = "media_player"
     FAN = "fan"
@@ -59,10 +63,12 @@ class EntityDescriptor(BaseModel):
     domain: str
     device_class: str | None = None
     device_id: str | None = None
+    device_name: str | None = None
     #: Home Assistant integration providing the entity, as shown on the device page.
     integration: str | None = None
     connectivity: Connectivity | None = None
     translation_key: str | None = None
+    unique_id: str | None = None
     disabled_by: str | None = None
     has_live_state: bool = True
     manufacturer: str | None = None
@@ -77,14 +83,33 @@ class EntityDescriptor(BaseModel):
     max_mired: int | None = None
     related_voltage_entity_id: str | None = None
     member_entity_ids: list[str] = Field(default_factory=list)
+    related_device_ids: list[str] = Field(default_factory=list)
+    suggested_recording_entity_ids: list[str] = Field(default_factory=list)
+    disabled_recording_entity_ids: list[str] = Field(default_factory=list)
 
 
 class EntityCatalogSnapshot:
     """Immutable view used for one selector or preflight operation."""
 
-    def __init__(self, entities: list[EntityDescriptor]) -> None:
-        self._entities = tuple(entities)
-        self._by_id = {entity.entity_id: entity for entity in entities}
+    def __init__(
+        self,
+        entities: list[EntityDescriptor],
+        related_device_ids: Mapping[str, list[str]] | None = None,
+    ) -> None:
+        self._related_device_ids = dict(related_device_ids or {})
+        self._entities = tuple(
+            entity.model_copy(
+                update={"related_device_ids": list(self._related_device_ids.get(entity.device_id or "", []))}
+            )
+            for entity in entities
+        )
+        self._by_id = {entity.entity_id: entity for entity in self._entities}
+
+    @property
+    def related_device_ids(self) -> Mapping[str, list[str]]:
+        """Devices whose entities PowerCalc profiles may reference, keyed by source device ID."""
+
+        return self._related_device_ids
 
     def select(
         self,
@@ -210,19 +235,27 @@ class HomeAssistantEntityCatalog:
             if entity_id not in live_ids
         )
         by_id = {descriptor.entity_id: descriptor for descriptor in descriptors}
-        return EntityCatalogSnapshot([_enrich_group_device_metadata(descriptor, by_id) for descriptor in descriptors])
+        return EntityCatalogSnapshot(
+            [_enrich_group_device_metadata(descriptor, by_id) for descriptor in descriptors],
+            map_profile_related_devices(data.device_registry),
+        )
 
 
 def _describe_registry_entity(entry: EntityRegistryEntry, devices: dict[str, dict[str, object]]) -> EntityDescriptor:
     """Describe an inventory-only entity with no live Home Assistant state."""
+    device = devices.get(entry.device_id or "", {})
+    manufacturer = device.get(HASS_DEVICE_REGISTRY_MANUFACTURER)
     return EntityDescriptor(
         entity_id=entry.entity_id,
         name=getattr(entry, "name", None) or getattr(entry, "original_name", None) or entry.entity_id,
         domain=entry.entity_id.partition(".")[0],
         device_id=entry.device_id,
+        device_name=_device_name(device),
         integration=entry.platform,
         connectivity=detect_connectivity(entry.platform, devices.get(entry.device_id or "", {})),
         translation_key=getattr(entry, "translation_key", None),
+        unique_id=getattr(entry, "unique_id", None),
+        manufacturer=str(manufacturer) if manufacturer else None,
         disabled_by=getattr(entry, "disabled_by", None),
         has_live_state=False,
         state="unavailable",
@@ -300,15 +333,19 @@ def _describe_entity(
     light_info = light_info_from_attributes(attributes) if domain == EntityDomain.LIGHT else None
     unit = attributes.get(HASS_ENTITY_UNIT_OF_MEASUREMENT)
     members = attributes.get(HASS_ENTITY_GROUP_MEMBERS)
+    integration = str(registry_entry.platform) if registry_entry is not None and registry_entry.platform else None
+    effects = [str(effect) for effect in (attributes.get("effect_list") or [])]
     return EntityDescriptor(
         entity_id=entity.entity_id,
         name=str(attributes.get("friendly_name", entity.entity_id)),
         domain=domain,
         device_class=device_class,
         device_id=device_id,
-        integration=str(registry_entry.platform) if registry_entry is not None and registry_entry.platform else None,
+        device_name=_device_name(device),
+        integration=integration,
         connectivity=(detect_connectivity(getattr(registry_entry, "platform", None), device) if not members else None),
         translation_key=getattr(registry_entry, "translation_key", None),
+        unique_id=getattr(registry_entry, "unique_id", None),
         disabled_by=getattr(registry_entry, "disabled_by", None),
         manufacturer=str(manufacturer) if manufacturer else None,
         model_id=str(model_id) if model_id else None,
@@ -317,11 +354,18 @@ def _describe_entity(
         unit=str(unit) if unit else None,
         attribute_names=sorted(attributes) if detailed else [],
         supported_modes=supported_modes,
-        effect_list=[str(effect) for effect in (attributes.get("effect_list") or [])] or None if detailed else None,
+        effect_list=(
+            filter_recordable_effects(effects, integration=integration, device=device) or None if detailed else None
+        ),
         min_mired=light_info.get_min_mired() if light_info is not None else None,
         max_mired=light_info.get_max_mired() if light_info is not None else None,
         member_entity_ids=[str(member) for member in members] if detailed and isinstance(members, list) else [],
     )
+
+
+def _device_name(device: dict[str, object]) -> str | None:
+    name = device.get("name_by_user") or device.get("name")
+    return str(name) if name else None
 
 
 def _parse_device_class(value: object) -> str | None:

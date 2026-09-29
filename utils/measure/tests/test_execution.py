@@ -9,6 +9,7 @@ from measure.analyser.execution import RecorderAnalysisExecution
 from measure.analyser.models import AnalysisStatus, RecorderAnalysisResult
 from measure.analyser.service import RecorderAnalyser
 from measure.cancellation import MeasurementCancelledError
+from measure.controller.fan.spec import DummyFanControllerSpec
 from measure.controller.light.spec import DummyLightControllerSpec
 from measure.dummy_load import DummyLoadCalibration
 from measure.execution import DummyLoadPreparation, MeasurementExecution, MeasurementPreparation, PreparedMeasurement
@@ -18,6 +19,7 @@ from measure.request import (
     DummyLoadCalibrationRequest,
     DummyLoadRequest,
     DummyLoadReuseRequest,
+    FanMeasurementRequest,
     LightMeasurementRequest,
     MeasurementRequest,
     RecorderMeasurementRequest,
@@ -297,6 +299,8 @@ def test_execution_analyses_complex_recording_and_writes_schema_valid_model(
         )
         return RunnerResult(model_json_data={}, voltages=[229.5, 231.0], summary={"Samples recorded": "20"})
 
+    write_recording(request, str(tmp_path))
+    (tmp_path / "record.jsonl").rename(tmp_path / "record-1.jsonl")
     runner.run.side_effect = write_recording
     interaction = MagicMock(spec=RunInteraction)
     prepared = PreparedMeasurement(request=request, runner=runner, interaction=interaction)
@@ -354,6 +358,7 @@ def test_execution_preserves_recording_when_analysis_fails(tmp_path: Path, caplo
         "Recording analysis reason": "Recording analysis failed: broken analyser",
     }
     assert "Recording analysis failed: broken analyser" in caplog.text
+    assert any(record.exc_info is not None for record in caplog.records)
 
 
 def test_analysis_without_reason_removes_stale_model_and_preserves_recording(tmp_path: Path) -> None:
@@ -430,7 +435,8 @@ def test_execution_completes_without_model_when_recording_is_insufficient(
         "Samples analysed": "10",
         "Recording analysis": "More data needed",
         "Recording analysis reason": (
-            "No state or scalar attribute had 2-20 usable values with at least 4 training samples per value"
+            "Use Record more to capture a second independent recording. Include every relevant state "
+            "for at least five samples in each run; the latest run is reserved for validation."
         ),
     }
     assert "Profile was not created" in caplog.text
@@ -446,12 +452,36 @@ def test_execution_runs_preparations_before_runner(tmp_path: Path) -> None:
     runner.writes_export_files.return_value = False
     runner.run.side_effect = lambda request, output: calls.append("run") or RunnerResult(model_json_data={})
     interaction = MagicMock(spec=RunInteraction)
+    interaction.confirm.side_effect = lambda message, *, action: calls.append("confirm")
     prepared = PreparedMeasurement(request=request, runner=runner, preparations=[preparation], interaction=interaction)
 
     MeasurementExecution(measurement=prepared, output_directory=tmp_path).run()
 
-    assert calls == ["prepare", "run"]
+    assert calls == ["prepare", "confirm", "run"]
     preparation.run.assert_called_once_with(interaction)
+    interaction.confirm.assert_called_once_with("Ready to start the average measurement.", action="Start averaging")
+
+
+def test_fan_waits_for_the_central_start_confirmation(tmp_path: Path) -> None:
+    request = FanMeasurementRequest(
+        power_meter=DummyPowerMeterSpec(), controller=DummyFanControllerSpec(), generate_model=False
+    )
+    runner = MagicMock(spec=MeasurementRunner)
+    runner.writes_export_files.return_value = False
+    runner.run.return_value = RunnerResult(model_json_data={})
+    interaction = MagicMock(spec=RunInteraction)
+
+    def confirm(message: str, *, action: str) -> None:
+        assert "control the selected fan speeds" in message
+        assert action == "Start fan measurement"
+        runner.run.assert_not_called()
+
+    interaction.confirm.side_effect = confirm
+    prepared = PreparedMeasurement(request=request, runner=runner, interaction=interaction)
+
+    MeasurementExecution(measurement=prepared, output_directory=tmp_path).run()
+
+    runner.run.assert_called_once_with(request, "")
 
 
 def test_dummy_load_reuse_requires_two_confirmations_and_configures_measure_util() -> None:
@@ -462,7 +492,7 @@ def test_dummy_load_reuse_requires_two_confirmations_and_configures_measure_util
 
     assert context.interaction.confirm.call_count == 2
     assert context.interaction.confirm.call_args_list[0].kwargs == {}
-    assert context.interaction.confirm.call_args_list[1].kwargs == {"action": "Start measurement"}
+    assert context.interaction.confirm.call_args_list[1].kwargs == {"action": "Continue"}
     assert "Connect the target device in parallel" in context.interaction.confirm.call_args_list[1].args[0]
     assert "calibration is complete" not in context.interaction.confirm.call_args_list[1].args[0]
     context.sampler.set_dummy_load_resistance.assert_called_once_with(812.4)
@@ -496,7 +526,7 @@ def test_dummy_load_calibration_repeats_until_steady_and_saves_result(monkeypatc
     assert first_confirmation.kwargs == {"action": "Start dummy-load calibration"}
     assert "Dummy-load calibration is complete" in second_confirmation.args[0]
     assert "Connect the light in parallel" in second_confirmation.args[0]
-    assert second_confirmation.kwargs == {"action": "Start measurement"}
+    assert second_confirmation.kwargs == {"action": "Continue"}
 
 
 def test_dummy_load_cancelled_during_calibration_is_not_saved() -> None:

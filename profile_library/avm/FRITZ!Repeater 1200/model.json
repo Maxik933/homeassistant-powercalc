@@ -4,7 +4,7 @@
   "device_type": "network",
   "device_specs": {
     "form_factor": "repeater",
-    "rated_power": 11.5,
+    "rated_power": 3.8,
     "connectivity": [
       "wifi",
       "ethernet"
@@ -22,7 +22,6 @@
   "measure_method": "manual",
   "mains_voltage": 230,
   "name": "FRITZ!Repeater 1200",
-  "product_url": "No longer listed",
   "authors": [
     {
       "github": "Maxik933",

@@ -13,8 +13,11 @@ from measure.controller.light.const import LutMode
 from measure.controller.light.spec import LightControllerSpec
 from measure.controller.media.spec import MediaControllerSpec
 from measure.controller.spec import BaseControllerSpec
+from measure.controller.switch.spec import SwitchControllerSpec
 from measure.powermeter.spec import DummyPowerMeterSpec, ManualPowerMeterSpec, PowerMeterSpec
+from measure.profile.device_type import PROFILE_DEVICE_DOMAINS, ProfileDeviceType
 from measure.recording.files import COMPLEX_PROFILE_EXPORT_FILENAME, DEFAULT_EXPORT_FILENAME
+from measure.recording.models import RecorderProfileRecipe as RecorderProfileRecipe
 from measure.tuning import MeasurementParameters
 
 
@@ -26,11 +29,6 @@ class ResumePolicy(StrEnum):
 class RecorderPurpose(StrEnum):
     PLAYBOOK = "playbook"
     COMPLEX_PROFILE = "complex_profile"
-
-
-class RecorderProfileRecipe(StrEnum):
-    GENERIC = "generic"
-    VACUUM_ROBOT = "vacuum_robot"
 
 
 class DummyLoadCalibrationRequest(BaseModel):
@@ -212,6 +210,8 @@ class RecorderMeasurementRequest(BaseMeasurementRequest):
     controller: None = None
     recorder_purpose: RecorderPurpose = RecorderPurpose.PLAYBOOK
     profile_recipe: RecorderProfileRecipe | None = None
+    primary_entity_id: str | None = None
+    profile_device_type: ProfileDeviceType | None = None
     tracked_entity_ids: tuple[str, ...] = Field(default=(), max_length=100)
     vacuum_entity_id: str | None = None
     battery_entity_id: str | None = None
@@ -231,6 +231,11 @@ class RecorderMeasurementRequest(BaseMeasurementRequest):
 
         if not isinstance(data, dict):
             return data
+        # Older generic requests used the first tracked entity as their primary.
+        if data.get("profile_recipe") == RecorderProfileRecipe.GENERIC and "primary_entity_id" not in data:
+            tracked = data.get("tracked_entity_ids")
+            if isinstance(tracked, list | tuple) and tracked:
+                data = data | {"primary_entity_id": tracked[0], "tracked_entity_ids": tracked[1:]}
         filename = (
             COMPLEX_PROFILE_EXPORT_FILENAME
             if data.get("recorder_purpose") == RecorderPurpose.COMPLEX_PROFILE
@@ -249,7 +254,7 @@ class RecorderMeasurementRequest(BaseMeasurementRequest):
             _validate_entity_id(value)
         return values
 
-    @field_validator("vacuum_entity_id", "battery_entity_id", mode="after")
+    @field_validator("primary_entity_id", "vacuum_entity_id", "battery_entity_id", mode="after")
     @classmethod
     def validate_optional_entity_id(cls, value: str | None) -> str | None:
         if value is not None:
@@ -280,6 +285,8 @@ class RecorderMeasurementRequest(BaseMeasurementRequest):
     def _has_profile_selection(self) -> bool:
         return bool(
             self.profile_recipe
+            or self.primary_entity_id
+            or self.profile_device_type
             or self.tracked_entity_ids
             or self.vacuum_entity_id
             or self.battery_entity_id
@@ -287,13 +294,22 @@ class RecorderMeasurementRequest(BaseMeasurementRequest):
         )
 
     def _validate_generic_selection(self) -> None:
-        if not self.tracked_entity_ids:
-            raise ValueError("Select at least one entity for a generic complex-profile recording")
+        if self.primary_entity_id is None:
+            raise ValueError("Select a primary entity for a generic complex-profile recording")
+        if self.profile_device_type == ProfileDeviceType.VACUUM_ROBOT:
+            raise ValueError("Use the robot vacuum recorder recipe for vacuum_robot profiles")
+        if self.profile_device_type is not None:
+            primary_domain = self.primary_entity_id.partition(".")[0]
+            if primary_domain not in PROFILE_DEVICE_DOMAINS[self.profile_device_type]:
+                raise ValueError(
+                    f"A {self.profile_device_type} profile requires a primary entity from "
+                    f"{', '.join(PROFILE_DEVICE_DOMAINS[self.profile_device_type])}"
+                )
         if self.vacuum_entity_id or self.battery_entity_id or self.additional_entity_ids:
             raise ValueError("Generic recordings cannot include vacuum-recipe entity selections")
 
     def _validate_vacuum_selection(self) -> None:
-        if self.tracked_entity_ids:
+        if self.tracked_entity_ids or self.primary_entity_id or self.profile_device_type:
             raise ValueError("Vacuum recordings cannot include generic tracked entities")
         if self.vacuum_entity_id is None or self.battery_entity_id is None:
             raise ValueError("A vacuum and battery entity are required for a vacuum recording")
@@ -309,7 +325,8 @@ class RecorderMeasurementRequest(BaseMeasurementRequest):
         if self.recorder_purpose == RecorderPurpose.PLAYBOOK:
             return []
         if self.profile_recipe == RecorderProfileRecipe.GENERIC:
-            return list(self.tracked_entity_ids)
+            assert self.primary_entity_id is not None
+            return [self.primary_entity_id, *self.tracked_entity_ids]
         return [
             entity_id
             for entity_id in (self.vacuum_entity_id, self.battery_entity_id, *self.additional_entity_ids)
@@ -320,8 +337,8 @@ class RecorderMeasurementRequest(BaseMeasurementRequest):
     def required_entity_ids(self) -> list[str]:
         """Recorded entities a sample cannot be written without.
 
-        A vacuum recipe only needs the vacuum and its battery; the additional entities the
-        frontend preselects from the device are best effort and may disappear mid-session.
+        A vacuum recipe only needs the vacuum and its battery; manually selected additional
+        entities are best effort and may disappear mid-session.
         """
 
         entity_ids = self.recorded_entity_ids
@@ -350,6 +367,24 @@ class FanMeasurementRequest(BaseMeasurementRequest):
     generate_model: bool = True
 
 
+class SmartSwitchMeasurementRequest(BaseMeasurementRequest):
+    """Measure relay self consumption with every output load disconnected."""
+
+    measure_type: Literal[MeasureType.SMART_SWITCH] = MeasureType.SMART_SWITCH
+    controller: SwitchControllerSpec
+    power_monitoring: bool
+    samples_per_state: int = Field(default=12, ge=5, le=100)
+    repeat_cycles: int = Field(default=3, ge=2, le=5)
+    settle_seconds: float = Field(default=5, ge=0, le=120)
+    generate_model: bool = True
+
+    @model_validator(mode="after")
+    def validate_switch_meter(self) -> SmartSwitchMeasurementRequest:
+        if isinstance(self.power_meter, ManualPowerMeterSpec):
+            raise ValueError("Smart switch measurements require an automatic precise power meter")
+        return self
+
+
 type MeasurementRequest = (
     LightMeasurementRequest
     | AverageMeasurementRequest
@@ -357,6 +392,7 @@ type MeasurementRequest = (
     | SpeakerMeasurementRequest
     | ChargingMeasurementRequest
     | FanMeasurementRequest
+    | SmartSwitchMeasurementRequest
 )
 
 MeasurementRequestPayload = Annotated[MeasurementRequest, Field(discriminator="measure_type")]

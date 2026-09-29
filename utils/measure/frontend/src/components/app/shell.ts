@@ -300,9 +300,15 @@ export class AppShell extends LitElement implements MeasureAppState {
   }
 
   private renderRunning(snapshot: SessionSnapshot) {
+    const startDefinition = this.isStartConfirmation() ? this.activeDefinition() : undefined;
     return html`
       <measure-running-view
         .snapshot=${snapshot} .confirmationAction=${this.confirmationAction()} .warningConfirmation=${this.confirmationIsWarning()}
+        .confirmationEyebrow=${startDefinition?.confirmation_eyebrow ?? "Preparation complete"}
+        .confirmationTitle=${startDefinition?.confirmation_title ?? "Everything is ready"}
+        .guidanceTitle=${startDefinition?.confirmation_guidance_title ?? "Before starting"}
+        .guidanceLabel=${startDefinition?.confirmation_guidance_label ?? "Measurement guidance"}
+        .guidance=${startDefinition?.confirmation_guidance ?? []}
         .connected=${this.connectedToEvents} .logs=${this.logs} .samples=${this.samples}
         .lastEventReceivedAt=${this.lastEventReceivedAt}
         .diagnosticsUrl=${this.api.diagnosticsUrl(snapshot.session_id ?? "")} .busy=${this.busy}
@@ -312,10 +318,12 @@ export class AppShell extends LitElement implements MeasureAppState {
 
   private renderResult(snapshot: SessionSnapshot) {
     const sessionId = snapshot.session_id ?? "";
+    const request = snapshot.request ?? this.request;
     return html`
       <measure-result-view
         .snapshot=${snapshot} .files=${this.files} .plotCollection=${this.plotCollection}
-        .canPrepareProfile=${this.measurementType() !== "average"}
+        .canPrepareProfile=${this.measurementType() !== "average"
+          && !(request?.measure_type === "recorder" && request.recorder_purpose === "playbook")}
         .fileUrl=${this.resultFileUrl} .downloadAll=${this.downloadAllFiles}
         .inspectJsonFile=${this.inspectResultJsonFile}
         .diagnosticsUrl=${this.api.diagnosticsUrl(sessionId)}
@@ -440,7 +448,12 @@ export class AppShell extends LitElement implements MeasureAppState {
   }
 
   private confirmationIsWarning(): boolean {
-    return this.activeDefinition()?.confirmation_is_warning ?? false;
+    return this.isStartConfirmation() && (this.activeDefinition()?.confirmation_is_warning ?? false);
+  }
+
+  private isStartConfirmation(): boolean {
+    const action = this.snapshot?.confirmation_action;
+    return Boolean(action && action === this.activeDefinition()?.confirmation_action);
   }
 
   /** Load everything the app needs to show a first screen. Also the seam the tests stub out. */

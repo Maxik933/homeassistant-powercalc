@@ -11,26 +11,23 @@ import type {
 } from "../../types";
 import {
   deviceFields,
-  entityDomain,
+  entityDomainsForOption,
   entityDomains,
   narrowingField,
   requestFieldValue,
 } from "../../measurement/definition";
 import { emit } from "../../utils/events";
 import { entitySelect, fieldHint, optionSelect, textField } from "../shared/fields";
-import { renderEntityList } from "./entity-list-field";
 import {
   activeParameters,
   availableOptions,
-  disabledVacuumEntityCount,
+  disabledVacuumEntityIds,
   entityChoices,
-  entityRows,
   selectedEntityId,
   selectedEntityIds,
   selectedOptions,
   selectValue,
   visible,
-  vacuumRecordingEntityIds,
   type FieldState,
 } from "./options";
 import "./tuning-section";
@@ -43,6 +40,11 @@ const HOME_ASSISTANT_GROUP_GUIDE_URL = "https://www.home-assistant.io/integratio
 export interface EntitySelectionChange {
   name: string;
   rows: string[];
+}
+
+export interface EntityDeviceChange {
+  name: string;
+  deviceId: string;
 }
 
 export interface SelectValueChange {
@@ -70,7 +72,9 @@ export class SetupFieldsSection extends LitElement {
   @property({ attribute: false }) deviceEntities: Record<string, EntityDescriptor[]> = {};
   @property({ attribute: false }) deviceEntityErrors: Record<string, string> = {};
   @property({ attribute: false }) selectedEntities: Record<string, string[]> = {};
+  @property({ attribute: false }) selectedEntityDeviceIds: Record<string, string> = {};
   @property({ attribute: false }) selectValues: Record<string, string> = {};
+  @property({ attribute: false }) presetValues: Record<string, string> = {};
   @property({ attribute: false }) multiSelection: Record<string, string[]> = {};
   @property({ attribute: false }) parameterValues: Partial<Record<MeasureParameterName, string>> = {};
   @property({ type: Boolean }) dummyController = false;
@@ -112,7 +116,8 @@ export class SetupFieldsSection extends LitElement {
     return html`
       <div class="device-section">
         ${this.dummyController ? html`<p class="test-mode-status" role="status">Virtual device · test output only</p>` : nothing}
-        ${multipleController && !this.dummyController ? this.renderMultipleLightsToggle(multipleController) : nothing}
+        ${multipleController && definition.measure_type === "light" && !this.dummyController
+          ? this.renderMultipleLightsToggle(multipleController) : nothing}
         <div class="field-with-help">
           <div class="grid profile-grid ${definition.measure_type === "light" ? "light-grid" : ""}">
             ${fields.filter((field) => field.control !== "multi_select").map((field) => this.renderField(field))}
@@ -206,13 +211,16 @@ export class SetupFieldsSection extends LitElement {
     if (field.derived_from) return this.renderDerivedCount(field);
     const stored = this.request && requestFieldValue(this.request, field);
     if (field.control === "boolean") {
-      return html`<label class="check"><input type="checkbox" name=${name} .checked=${Boolean(stored ?? field.default)} />${field.label}</label>`;
+      return html`<div class="field-block">
+        <label class="check"><input type="checkbox" name=${name} .checked=${Boolean(stored ?? field.default)} />${field.label}</label>
+        ${field.hint ? fieldHint(field.hint) : nothing}
+      </div>`;
     }
     if (field.control === "entity") {
       const value = (stored ?? field.default ?? "").toString();
       const source = narrowingField(definition, field);
       const domains = source
-        ? [entityDomain(definition, field, selectValue(source, this.fieldState))].filter((domain): domain is string => Boolean(domain))
+        ? entityDomainsForOption(definition, field, selectValue(source, this.fieldState))
         : this.fieldDomains(field);
       const failed = field.all_entities
         ? (this.deviceEntityErrors["*"] ? "*" : undefined)
@@ -221,12 +229,16 @@ export class SetupFieldsSection extends LitElement {
         return html`<div class="notice error" role="alert">Could not load ${field.label.toLowerCase()} entities: ${this.deviceEntityErrors[failed]}</div>`;
       }
       const entities = entityChoices(field, this.fieldState, domains);
-      if (field.multiple && (field.role !== "controller" || this.multipleLights)) {
+      if (field.multiple && (!field.multiple_toggle || this.multipleLights)) {
         return this.renderMultiEntity(field, entities);
       }
-      let selected = field.multiple ? selectedEntityId(field, this.fieldState) || value : value;
+      let selected = this.selectedEntities[name] !== undefined ? selectedEntityId(field, this.fieldState) : value;
+      if (source && selected && !entities.some((entity) => entity.entity_id === selected)) selected = "";
       if (!selected && field.same_device_only && entities.length === 1) selected = entities[0]?.entity_id ?? "";
-      const relatedMissing = Boolean(field.same_device_only && field.related_to && entities.length === 0);
+      const relatedField = definition.fields.find((candidate) => candidate.name === field.related_to);
+      const relatedMissing = Boolean(
+        field.same_device_only && relatedField && selectedEntityId(relatedField, this.fieldState) && entities.length === 0,
+      );
       const selector = entitySelect(name, field.label, entities, {
         selected,
         required: field.required,
@@ -240,15 +252,15 @@ export class SetupFieldsSection extends LitElement {
       </div>`;
     }
     if (field.control === "select") {
+      if (name in this.presetValues) {
+        return html`<input type="hidden" name=${name} .value=${this.presetValues[name] ?? ""} />`;
+      }
       const value = selectValue(field, this.fieldState) ?? (stored ?? field.default ?? "").toString();
-      const affectsAnother = definition.fields.some(
-        (candidate) => candidate.narrowed_by === name || Object.hasOwn(candidate.visible_when ?? {}, name),
-      );
       const selectedOption = field.options.find((option) => option.value === value);
       return html`<div class="field-block">${optionSelect(name, field.label, field.options, {
         selected: value,
         required: field.required,
-        onChange: affectsAnother ? this.selectChanged : null,
+        onChange: this.selectChanged,
       })}${this.optionGuidance(selectedOption)}</div>`;
     }
     return this.valueField(field, (stored ?? field.default ?? "").toString());
@@ -290,20 +302,47 @@ export class SetupFieldsSection extends LitElement {
   }
 
   private renderMultiEntity(field: FormField, entities: EntityDescriptor[]) {
+    if (field.group_by_device) return this.renderDeviceEntities(field, entities);
     const vacuumAdditional = this.definition?.measure_type === "recorder" && field.name === "additional_entity_ids";
-    const lightController = this.definition?.measure_type === "light" && field.role === "controller";
-    if (vacuumAdditional || lightController) {
-      return html`<div class="field-block">
-        ${this.renderEntityCombobox(field, entities, vacuumAdditional ? "Select additional entities" : "Select lights")}
-        ${vacuumAdditional ? this.renderVacuumRecordingHint(field) : nothing}
-      </div>`;
+    const placeholder = field.role === "controller"
+      ? `Select ${(field.plural_label || field.label).toLowerCase()}`
+      : "Select additional entities";
+    return html`<div class="field-block">
+      ${this.renderEntityCombobox(field, entities, placeholder)}
+      ${vacuumAdditional ? this.renderVacuumRecordingHint(field) : field.hint ? fieldHint(field.hint) : nothing}
+    </div>`;
+  }
+
+  private renderDeviceEntities(field: FormField, entities: EntityDescriptor[]) {
+    const devices = new Map<string, string>();
+    for (const entity of entities) {
+      if (entity.device_id && !devices.has(entity.device_id)) {
+        devices.set(entity.device_id, entity.device_name || entity.product_name || entity.name);
+      }
     }
-    return renderEntityList({
-      field,
-      entities,
-      rows: this.fieldState ? entityRows(field, this.fieldState) : [],
-      onChange: (rows) => this.changeEntities(field.name, rows),
-    });
+    const selected = this.fieldState ? selectedEntityIds(field, this.fieldState) : [];
+    const savedDeviceId = entities.find((entity) => selected.includes(entity.entity_id))?.device_id ?? "";
+    const deviceId = this.selectedEntityDeviceIds[field.name] ?? savedDeviceId;
+    const deviceOptions = [...devices].map(([value, label]) => ({ value, label }));
+    deviceOptions.sort((left, right) => left.label.localeCompare(right.label));
+    return html`<div class="field-block">
+      ${optionSelect(`device_${field.name}`, "Device", deviceOptions, {
+        selected: deviceId,
+        required: true,
+        placeholder: "Select a device",
+        onChange: (event) => this.changeEntityDevice(field.name, event),
+      })}
+      ${deviceId ? this.renderEntityCombobox(
+        field, entities.filter((entity) => entity.device_id === deviceId), `Select ${(field.plural_label || field.label).toLowerCase()}`,
+      ) : nothing}
+      ${field.hint ? fieldHint(field.hint) : nothing}
+      ${devices.size === 0 ? html`<p class="muted">No available switch entities are assigned to a Home Assistant device.</p>` : nothing}
+    </div>`;
+  }
+
+  private changeEntityDevice(name: string, event: Event): void {
+    const deviceId = (event.currentTarget as HTMLInputElement).value;
+    emit<EntityDeviceChange>(this, "entity-device-change", { name, deviceId });
   }
 
   private renderEntityCombobox(field: FormField, entities: EntityDescriptor[], placeholder: string) {
@@ -323,11 +362,12 @@ export class SetupFieldsSection extends LitElement {
   private renderVacuumRecordingHint(field: FormField) {
     const state = this.fieldState;
     const selected = state ? selectedEntityIds(field, state).length : 0;
-    const disabled = state ? disabledVacuumEntityCount(state) : 0;
-    const disabledHint = disabled ? `${disabled} disabled entities are listed in recording metadata only.` : "";
+    const disabled = state ? disabledVacuumEntityIds(state) : [];
+    const disabledHint = disabled.length
+      ? `Useful activity entities are disabled: ${disabled.join(", ")}. Enable them in Home Assistant and reload to include them.`
+      : "";
     return html`<p class="muted">
-      ${selected} additional entities selected. Available device entities are selected by default;
-      you can remove them or add dock entities. Camera and image entities are not selected automatically.
+      ${field.hint} ${selected} additional entities selected.
       ${disabledHint}
     </p>`;
   }
@@ -363,9 +403,10 @@ export class SetupFieldsSection extends LitElement {
     const select = event.currentTarget as HTMLInputElement;
     this.changeEntities(select.name, [select.value]);
     for (const dependent of this.definition?.fields.filter((field) => field.related_to === select.name) ?? []) {
-      this.changeEntities(dependent.name, dependent.name === "additional_entity_ids"
-        ? vacuumRecordingEntityIds(this.deviceEntities["*"] ?? [], select.value)
-        : []);
+      const suggestions = dependent.name === "additional_entity_ids"
+        ? this.deviceEntities["*"]?.find((entity) => entity.entity_id === select.value)?.suggested_recording_entity_ids
+        : undefined;
+      this.changeEntities(dependent.name, suggestions ?? []);
     }
     if (select.name === "battery_entity_id" && this.fieldState) {
       const additional = this.definition?.fields.find((field) => field.name === "additional_entity_ids");

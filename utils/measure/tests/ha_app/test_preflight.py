@@ -11,6 +11,7 @@ from measure.controller.light.spec import (
     HassMultiLightControllerSpec,
 )
 from measure.controller.media.spec import DummyMediaControllerSpec, HassMediaControllerSpec
+from measure.controller.switch.spec import HassMultiSwitchControllerSpec, HassSwitchControllerSpec
 from measure.ha_app.preflight import ActiveSessionError, EntityRecord, MeasurementPreflight, PreflightError
 from measure.home_assistant.entities import DeviceClass
 from measure.powermeter.diagnostics import DiagnosticStatus, PowerMeterDiagnostic
@@ -22,8 +23,10 @@ from measure.request import (
     FanMeasurementRequest,
     LightMeasurementRequest,
     RecorderMeasurementRequest,
+    SmartSwitchMeasurementRequest,
     SpeakerMeasurementRequest,
 )
+from measure.tuning import MeasurementParameters
 import pytest
 
 
@@ -37,10 +40,12 @@ class Entity(EntityRecord):
     state: str = "available"
     attribute_names: list[str] = field(default_factory=list)
     device_id: str | None = None
+    related_device_ids: list[str] = field(default_factory=list)
     model_id: str | None = None
     member_entity_ids: list[str] = field(default_factory=list)
     domain: str = ""
     device_class: str | None = None
+    unit: str | None = None
     disabled_by: str | None = None
     has_live_state: bool = True
 
@@ -87,6 +92,70 @@ def base_entities() -> dict[tuple[str | None, str | None], list[Entity]]:
         ("lawn_mower", None): [Entity("lawn_mower.test", attribute_names=["battery_level"])],
         ("sensor", None): [Entity("sensor.battery", state="75")],
     }
+
+
+def test_smart_switch_preflight_accepts_external_meter_and_same_device_relays() -> None:
+    entities = base_entities()
+    entities[("switch", None)] = [
+        Entity("switch.one", state="on", device_id="switch-device"),
+        Entity("switch.two", state="off", device_id="switch-device"),
+    ]
+    power = Entity("sensor.external_power", state="0.5", device_id="meter-device")
+    entities[("sensor", None)].append(power)
+    entities[(None, "power")].append(power)
+    request = SmartSwitchMeasurementRequest(
+        power_meter=HassPowerMeterSpec(entity_id="sensor.external_power"),
+        controller=HassMultiSwitchControllerSpec(entity_ids=["switch.one", "switch.two"]),
+        power_monitoring=True,
+    )
+
+    result = preflight(entities).validate(request)
+
+    assert result.estimated_variations == 12
+    assert result.estimated_duration_seconds == 468
+
+
+@pytest.mark.parametrize(
+    "relay_state, second_device, meter_device, expected",
+    [
+        ("unavailable", "switch-device", "meter-device", "on or off state"),
+        ("idle", "switch-device", "meter-device", "on or off state"),
+        ("on", "other-device", "meter-device", "same Home Assistant device"),
+        ("on", "switch-device", "switch-device", "external power meter"),
+    ],
+)
+def test_smart_switch_preflight_rejects_invalid_selection(
+    relay_state: str, second_device: str, meter_device: str, expected: str
+) -> None:
+    entities = base_entities()
+    entities[("switch", None)] = [
+        Entity("switch.one", state="on", device_id="switch-device"),
+        Entity("switch.two", state=relay_state, device_id=second_device),
+    ]
+    power = Entity("sensor.external_power", state="0.5", device_id=meter_device)
+    entities[("sensor", None)].append(power)
+    entities[(None, "power")].append(power)
+    request = SmartSwitchMeasurementRequest(
+        power_meter=HassPowerMeterSpec(entity_id="sensor.external_power"),
+        controller=HassMultiSwitchControllerSpec(entity_ids=["switch.one", "switch.two"]),
+        power_monitoring=True,
+    )
+
+    with pytest.raises(PreflightError, match=expected):
+        preflight(entities).validate(request)
+
+
+def test_smart_switch_preflight_requires_registered_switch_device() -> None:
+    entities = base_entities()
+    entities[("switch", None)] = [Entity("switch.one", state="off")]
+    request = SmartSwitchMeasurementRequest(
+        power_meter=ShellyPowerMeterSpec(device_ip="192.0.2.1"),
+        controller=HassSwitchControllerSpec(entity_id="switch.one"),
+        power_monitoring=False,
+    )
+
+    with pytest.raises(PreflightError, match="same Home Assistant device"):
+        preflight(entities).validate(request)
 
 
 def test_preflight_accepts_request_without_meter_diagnostics() -> None:
@@ -327,7 +396,7 @@ def test_preflight_rejects_missing_hass_power_entity_for_non_light_kind() -> Non
 def test_preflight_warns_instead_of_failing_for_unusable_optional_recorder_entity(
     extra: Entity | None, message: str
 ) -> None:
-    """A stored request must stay runnable when an auto-selected device entity goes away.
+    """A stored request must stay runnable when an additional entity goes away.
 
     The runner records such an entity as "unavailable", so record-more and resume would be
     permanently blocked if preflight rejected the whole request over it.
@@ -466,6 +535,67 @@ def test_preflight_accepts_generic_recorder_entity_from_complete_catalog() -> No
     )
 
     assert preflight(entities).validate(request).warnings == []
+
+
+@pytest.mark.parametrize("unit,accepted", [(None, True), ("pages", False)])
+def test_printer_recorder_requires_unitless_primary_sensor(unit: str | None, accepted: bool) -> None:
+    entities = base_entities()
+    entities[("sensor", None)] = [Entity("sensor.printer_state", domain="sensor", unit=unit)]
+    request = RecorderMeasurementRequest(
+        power_meter=DummyPowerMeterSpec(),
+        recorder_purpose="complex_profile",
+        profile_recipe="generic",
+        profile_device_type="printer",
+        primary_entity_id="sensor.printer_state",
+    )
+
+    if accepted:
+        assert preflight(entities).validate(request).warnings == []
+    else:
+        with pytest.raises(PreflightError, match="without a unit of measurement"):
+            preflight(entities).validate(request)
+
+
+@pytest.mark.parametrize(
+    "signal_device,accepted", [("main", True), ("parent", True), ("child", True), ("elsewhere", False)]
+)
+def test_generic_recorder_signals_require_same_or_related_device(signal_device: str, accepted: bool) -> None:
+    entities = base_entities()
+    entities[("sensor", None)] = [
+        Entity("sensor.primary", domain="sensor", device_id="main", related_device_ids=["parent", "child"]),
+        Entity("sensor.signal", domain="sensor", device_id=signal_device),
+    ]
+    request = RecorderMeasurementRequest(
+        power_meter=DummyPowerMeterSpec(),
+        recorder_purpose="complex_profile",
+        profile_recipe="generic",
+        primary_entity_id="sensor.primary",
+        tracked_entity_ids=("sensor.signal",),
+    )
+
+    if accepted:
+        assert preflight(entities).validate(request).warnings == []
+    else:
+        with pytest.raises(PreflightError, match="primary device or its parent or child"):
+            preflight(entities).validate(request)
+
+
+def test_generic_recorder_signals_require_primary_device_metadata() -> None:
+    entities = base_entities()
+    entities[("sensor", None)] = [
+        Entity("sensor.primary", domain="sensor"),
+        Entity("sensor.signal", domain="sensor", device_id="other"),
+    ]
+    request = RecorderMeasurementRequest(
+        power_meter=DummyPowerMeterSpec(),
+        recorder_purpose="complex_profile",
+        profile_recipe="generic",
+        primary_entity_id="sensor.primary",
+        tracked_entity_ids=("sensor.signal",),
+    )
+
+    with pytest.raises(PreflightError, match="primary entity with a Home Assistant device"):
+        preflight(entities).validate(request)
 
 
 def test_preflight_rejects_missing_complex_recorder_entity() -> None:
@@ -829,6 +959,25 @@ def test_hs_preflight_uses_default_native_resolution() -> None:
     assert result.estimated_variations == 2_025
 
 
+@pytest.mark.parametrize("effects,expected_variations", [(["colorloop"], 8), ([], 0)])
+def test_effect_preflight_uses_recordable_effects(effects: list[str], expected_variations: int) -> None:
+    entities = base_entities()
+    entities[("light", None)] = [Entity("light.test", [LutMode.EFFECT], effect_list=effects)]
+    request = LightMeasurementRequest(
+        model_id="L122FF63H11A5.0W",
+        product_name="Test light",
+        measure_device="Test meter",
+        power_meter=HassPowerMeterSpec(entity_id="sensor.power"),
+        controller=HassLightControllerSpec(entity_id="light.test"),
+        modes={LutMode.EFFECT},
+    )
+
+    result = preflight(entities).validate(request)
+
+    assert result.estimated_variations == expected_variations
+    assert result.estimated_duration_seconds == (1471 if effects else 0)
+
+
 def test_multi_light_preflight_uses_common_capabilities_and_models() -> None:
     entities = base_entities()
     entities[("light", None)] = [
@@ -959,3 +1108,18 @@ def test_non_hass_power_meter_does_not_require_power_entity() -> None:
     result = preflight({}).validate(request)
 
     assert result.warnings == []
+
+
+@pytest.mark.parametrize("developer_mode", [False, True])
+def test_accepting_zero_power_requires_developer_mode(developer_mode: bool) -> None:
+    request = AverageMeasurementRequest(
+        power_meter=HassPowerMeterSpec(entity_id="sensor.power"),
+        parameters=MeasurementParameters(allow_zero_power=True),
+    )
+    checker = preflight(base_entities(), developer_mode=developer_mode)
+
+    if developer_mode:
+        checker.validate(request)
+    else:
+        with pytest.raises(PreflightError, match="0 W readings requires developer mode"):
+            checker.validate(request)

@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 
 from measure.cancellation import MeasurementCancelledError
 from measure.powermeter.spec import DummyPowerMeterSpec
-from measure.recording.models import RecordedEntity, RecordingContext
+from measure.recording.models import RecordedEntity, RecorderProfileRecipe, RecordingContext
 from measure.request import AverageMeasurementRequest, RecorderMeasurementRequest
 from measure.runner.average import AverageRunner
 from measure.runner.interaction import RunInteraction
@@ -24,7 +24,7 @@ def test_average_has_no_separate_standby_measurement() -> None:
     sampler.take_average_measurement.assert_not_called()
 
 
-def test_average_reports_start_phase_after_confirmation() -> None:
+def test_average_reports_start_phase() -> None:
     sampler = MagicMock(spec=PowerSampler)
     sampler.take_average_measurement.return_value = MeasurementResult(power=4.2, voltages=[])
     interaction = MagicMock(spec=RunInteraction)
@@ -32,7 +32,7 @@ def test_average_reports_start_phase_after_confirmation() -> None:
 
     runner.run(AverageMeasurementRequest(power_meter=DummyPowerMeterSpec(), duration=10), "")
 
-    interaction.confirm.assert_called_once_with("Ready to start the average measurement.")
+    interaction.confirm.assert_not_called()
     interaction.phase.assert_called_once_with("Starting averaging")
     assert sampler.take_average_measurement.call_args.kwargs["finish_on_interrupt"] is True
 
@@ -70,7 +70,7 @@ def test_recorder_treats_app_stop_as_successful_completion(tmp_path: Path) -> No
     export_directory = str(tmp_path)
     result = runner.run(request, export_directory)
 
-    interaction.confirm.assert_called_once_with("Ready to start recording. Stop the measurement when you are finished.")
+    interaction.confirm.assert_not_called()
     interaction.phase.assert_called_once_with("Starting recording")
     assert result.summary is not None
     assert result.summary["Samples recorded"] == "1"
@@ -226,7 +226,7 @@ def test_vacuum_recorder_keeps_samples_when_optional_entities_disappear(
     )
     primary = RecordedEntity("vacuum.robot", "vacuum", "primary", integration="dreame_vacuum", translation_key="vacuum")
     context = RecordingContext(
-        "vacuum_robot",
+        RecorderProfileRecipe.VACUUM_ROBOT,
         "vacuum.robot",
         "vacuum_robot",
         [
