@@ -1,0 +1,36 @@
+{
+  "calculation_strategy": "fixed",
+  "created_at": "2026-10-22T22:44:23Z",
+  "device_type": "network",
+  "device_specs": {
+    "form_factor": "router",
+    "rated_power": 27.5,
+    "connectivity": [
+      "wifi",
+      "ethernet",
+      "USB"
+    ]
+  },
+  "discovery_by": "device",
+  "gtin": [
+    "4023125028571"
+  ],
+  "fixed_config": {
+    "power": 12.40
+  },
+  "measure_description": "Measured with Powercalc measure tool in Average mode (600 seconds)",
+  "measure_device": "Shelly Plug S Gen3",
+  "measure_method": "manual",
+  "mains_voltage": 230,
+  "measure_settings": {
+    "VERSION": "v0.14.0:app"
+  },
+  "name": "FRITZ!Box 6591 Cable",
+  "product_url": "https://fritz.com/pages/service-fritz-box-6591-cable",
+  "authors": [
+    {
+      "name": "Maxik933",
+      "github": "Maxik933"
+    }
+  ]
+}
