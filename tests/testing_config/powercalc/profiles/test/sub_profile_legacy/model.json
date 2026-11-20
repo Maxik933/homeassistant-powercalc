@@ -1,0 +1,9 @@
+{
+  "calculation_strategy": "fixed",
+  "device_type": "smart_switch",
+  "discovery_by": "entity",
+  "name": "Profile with a renamed sub profile",
+  "sub_profile_select": {
+    "default": "old_name"
+  }
+}

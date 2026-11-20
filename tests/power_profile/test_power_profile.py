@@ -122,6 +122,47 @@ async def test_load_sub_profile(hass: HomeAssistant) -> None:
     assert power_profile.sub_profile == "ambilight"
 
 
+async def test_load_sub_profile_with_legacy_id(hass: HomeAssistant) -> None:
+    """A published sub profile can be renamed by declaring the old directory name as a legacy id."""
+    library = await ProfileLibrary.factory(hass)
+    power_profile = await library.get_profile(
+        ModelInfo("test", "test/old_name"),
+        custom_directory=get_test_profile_dir("sub_profile_legacy"),
+    )
+
+    assert power_profile.sub_profile == "new_name"
+    assert power_profile.get_model_directory() == get_test_profile_dir("sub_profile_legacy/new_name")
+
+
+def test_resolve_sub_profile_prefers_exact_directory(hass: HomeAssistant) -> None:
+    """An existing directory must never be shadowed by another profile's legacy id."""
+    power_profile = PowerProfile(
+        hass,
+        "test",
+        "test",
+        "",
+        {},
+        [
+            ("old_name", {}),
+            ("new_name", {"legacy_ids": ["old_name"]}),
+        ],
+    )
+
+    assert power_profile.resolve_sub_profile("old_name") == "old_name"
+    assert power_profile.resolve_sub_profile("unknown") is None
+
+
+async def test_sub_profile_select_default_with_legacy_id(hass: HomeAssistant) -> None:
+    """A sub_profile_select default may reference a legacy id."""
+    library = await ProfileLibrary.factory(hass)
+    power_profile = await library.get_profile(
+        ModelInfo("test", "test"),
+        custom_directory=get_test_profile_dir("sub_profile_legacy"),
+    )
+
+    assert power_profile.sub_profile == "new_name"
+
+
 async def test_load_sub_profile_without_model_json(hass: HomeAssistant) -> None:
     """Test if sub profile can be loaded correctly when the sub directories don't have an own model.json"""
     library = await ProfileLibrary.factory(hass)

@@ -1,4 +1,5 @@
 from datetime import timedelta
+import os
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_DEVICE, CONF_ENABLED, CONF_ID, CONF_PATH, EntityCategory
@@ -10,6 +11,7 @@ from homeassistant.helpers.typing import ConfigType
 
 from custom_components.powercalc.const import (
     CONF_CREATE_ENERGY_SENSOR,
+    CONF_CUSTOM_MODEL_DIRECTORY,
     CONF_DISCOVERY,
     CONF_DISCOVERY_EXCLUDE_DEVICE_TYPES_DEPRECATED,
     CONF_DISCOVERY_EXCLUDE_SELF_USAGE_DEPRECATED,
@@ -36,6 +38,8 @@ from custom_components.powercalc.const import (
     DOMAIN,
     ENTRY_GLOBAL_CONFIG_UNIQUE_ID,
 )
+from custom_components.powercalc.errors import ModelNotSupportedError
+from custom_components.powercalc.power_profile.error import LibraryError
 from custom_components.powercalc.power_profile.library import ModelInfo, ProfileLibrary
 
 
@@ -164,15 +168,35 @@ async def async_fix_legacy_profile_config_entry(hass: HomeAssistant, config_entr
 
     library = await ProfileLibrary.factory(hass)
     migrated_profile = await library.find_model_migration(ModelInfo(str(manufacturer), model_id))
-    if migrated_profile is None:
+
+    resolved_manufacturer = migrated_profile.manufacturer if migrated_profile else str(manufacturer)
+    migrated_model = migrated_profile.model if migrated_profile else model_id
+
+    canonical_sub_profile = sub_profile
+    if sub_profile:
+        custom_directory = config_entry.data.get(CONF_CUSTOM_MODEL_DIRECTORY)
+        if custom_directory:
+            custom_directory = os.path.join(hass.config.config_dir, custom_directory)
+        try:
+            profile = await library.get_profile(
+                ModelInfo(resolved_manufacturer, migrated_model),
+                custom_directory=custom_directory,
+                process_variables=False,
+            )
+            canonical_sub_profile = profile.resolve_sub_profile(sub_profile) or sub_profile
+        except LibraryError, ModelNotSupportedError:
+            # Leave the reference untouched when the profile cannot be loaded here.
+            # Sensor setup will surface the underlying error with more context.
+            canonical_sub_profile = sub_profile
+
+    if (
+        migrated_model == model_id
+        and str(manufacturer).lower() == resolved_manufacturer.lower()
+        and canonical_sub_profile == sub_profile
+    ):
         return
 
-    resolved_manufacturer = migrated_profile.manufacturer
-    migrated_model = migrated_profile.model
-    if migrated_model == model_id and str(manufacturer).lower() == resolved_manufacturer.lower():
-        return
-
-    updated_model = f"{migrated_model}/{sub_profile}" if sub_profile else migrated_model
+    updated_model = f"{migrated_model}/{canonical_sub_profile}" if canonical_sub_profile else migrated_model
     hass.config_entries.async_update_entry(
         config_entry,
         data={

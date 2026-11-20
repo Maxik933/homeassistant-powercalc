@@ -437,6 +437,24 @@ class PowerProfile:
         """Check whether this profile has sub profiles."""
         return len(await self.get_sub_profiles()) > 0
 
+    def resolve_sub_profile(self, sub_profile: str) -> str | None:
+        """Return the canonical directory for a sub profile id.
+
+        A sub profile can declare one or more `legacy_ids` in its own model.json.
+        Those ids are resolved to the directory declaring them, which allows
+        renaming a published sub profile without breaking existing configurations.
+        """
+        # Exact matches always win, so a legacy id can never shadow a real directory.
+        for sub_dir, _ in self._sub_profiles:
+            if sub_dir == sub_profile:
+                return sub_dir
+
+        for sub_dir, json_data in self._sub_profiles:
+            if sub_profile in (json_data.get("legacy_ids") or []):
+                return sub_dir
+
+        return None
+
     @property
     async def requires_manual_sub_profile_selection(self) -> bool:
         """Check whether this profile requires manual sub profile selection."""
@@ -474,30 +492,26 @@ class PowerProfile:
         if not await self.has_sub_profiles:
             return
 
-        # Sub profile already selected, no need to load it again
-        if self.sub_profile == sub_profile:
-            return
-
-        sub_profiles = await self.get_sub_profiles()
-        found_profile = None
-        for sub_dir, json_data in sub_profiles:
-            if sub_dir == sub_profile:
-                found_profile = json_data
-                break
-
-        if found_profile is None:
+        canonical_sub_profile = self.resolve_sub_profile(sub_profile)
+        if canonical_sub_profile is None:
             raise ModelNotSupportedError(
                 f"Sub profile not found (manufacturer: {self._manufacturer}, "
                 f"model: {self._model}, sub_profile: {sub_profile})",
             )
 
-        self._sub_profile_dir = os.path.join(self._directory, sub_profile)
-        _LOGGER.debug("Loading sub profile: %s", sub_profile)
+        # Sub profile already selected, no need to load it again
+        if self.sub_profile == canonical_sub_profile:
+            return
+
+        found_profile = next(json_data for sub_dir, json_data in self._sub_profiles if sub_dir == canonical_sub_profile)
+
+        self._sub_profile_dir = os.path.join(self._directory, canonical_sub_profile)
+        _LOGGER.debug("Loading sub profile: %s", canonical_sub_profile)
 
         self._json_data = deepcopy(self._base_json_data)
         self._json_data.update(deepcopy(found_profile))
 
-        self.sub_profile = sub_profile
+        self.sub_profile = canonical_sub_profile
 
     @property
     async def needs_user_configuration(self) -> bool:

@@ -1,0 +1,7 @@
+{
+  "legacy_ids": [
+    "old_name"
+  ],
+  "name": "New name",
+  "standby_power": 0.5
+}

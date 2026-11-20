@@ -329,6 +329,7 @@ async def test_fix_legacy_library_model_reference(
 
     library = Mock()
     library.find_model_migration = AsyncMock(return_value=migrated_profile)
+    library.get_profile = AsyncMock(return_value=Mock(resolve_sub_profile=Mock(return_value=None)))
 
     with (
         patch("custom_components.powercalc.migrate.ProfileLibrary.factory", AsyncMock(return_value=library)),
@@ -346,4 +347,56 @@ async def test_fix_legacy_library_model_reference(
         mock_update_entry.assert_not_called()
 
     assert mock_entry.version == PowercalcConfigFlow.VERSION
+    assert mock_entry.data[CONF_MODEL] == expected_model
+
+
+@pytest.mark.parametrize(
+    "input_model, migrated_profile, canonical_sub_profile, expected_model, expect_update",
+    [
+        ("test/old_name", None, "new_name", "test/new_name", True),
+        ("test/old_name", ModelInfo("test", "renamed_model"), "new_name", "renamed_model/new_name", True),
+        ("test/new_name", None, None, "test/new_name", False),
+    ],
+)
+async def test_fix_legacy_sub_profile_reference(
+    hass: HomeAssistant,
+    input_model: str,
+    migrated_profile: ModelInfo | None,
+    canonical_sub_profile: str | None,
+    expected_model: str,
+    expect_update: bool,
+) -> None:
+    """Test normalization of legacy sub profile directory names."""
+    mock_entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_SENSOR_TYPE: SensorType.VIRTUAL_POWER,
+            CONF_MANUFACTURER: "test",
+            CONF_MODEL: input_model,
+        },
+        version=PowercalcConfigFlow.VERSION,
+    )
+    mock_entry.add_to_hass(hass)
+
+    profile = Mock()
+    profile.resolve_sub_profile = Mock(return_value=canonical_sub_profile)
+    library = Mock()
+    library.find_model_migration = AsyncMock(return_value=migrated_profile)
+    library.get_profile = AsyncMock(return_value=profile)
+
+    with (
+        patch("custom_components.powercalc.migrate.ProfileLibrary.factory", AsyncMock(return_value=library)),
+        patch.object(
+            hass.config_entries,
+            "async_update_entry",
+            wraps=hass.config_entries.async_update_entry,
+        ) as mock_update_entry,
+    ):
+        await async_fix_legacy_profile_config_entry(hass, mock_entry)
+
+    if expect_update:
+        mock_update_entry.assert_called_once()
+    else:
+        mock_update_entry.assert_not_called()
+
     assert mock_entry.data[CONF_MODEL] == expected_model

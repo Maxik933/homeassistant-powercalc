@@ -207,7 +207,7 @@
       "items": {
         "type": "string"
       },
-      "description": "Legacy canonical model ids which should migrate to this model"
+      "description": "Legacy canonical ids which should migrate to this model. Sub profile model.json files can use the same field to alias a previous directory name."
     },
     "compatible_integrations": {
       "type": "array",
